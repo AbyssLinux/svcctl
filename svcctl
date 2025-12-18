@@ -1,0 +1,1338 @@
+#!/bin/sh
+
+VERSION="1.0.0"
+
+SV_DIR="/etc/sv"
+SERVICE_DIR="/var/service"
+PROFILE_DIR="/etc/svcctl/profiles"
+LOCAL_DIR="/etc/svcctl/local"
+STATE_DIR="/var/lib/svcctl"
+SNAPSHOT_DIR="$STATE_DIR/snapshots"
+
+EXIT_SUCCESS=0
+EXIT_FAILURE=1
+EXIT_USAGE=2
+EXIT_NOT_FOUND=3
+EXIT_NOT_ENABLED=4
+EXIT_PERMISSION=5
+EXIT_TIMEOUT=6
+
+TIMEOUT=30
+QUIET=0
+VERBOSE=0
+COLOR=1
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+print_color() {
+    if [ "$COLOR" -eq 1 ] && [ -t 2 ]; then
+        case "${TERM:-}" in
+            dumb|unknown|"")
+                printf '%s' "$2"
+                ;;
+            *)
+                printf '%b%s%b' "$1" "$2" "$NC"
+                ;;
+        esac
+    else
+        printf '%s' "$2"
+    fi
+}
+
+print_error() {
+    if [ "$QUIET" -eq 0 ]; then
+        print_color "$RED" "error: $1" >&2
+        echo >&2
+    fi
+}
+
+print_verbose() {
+    if [ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ]; then
+        printf '%s\n' "$1" >&2
+    fi
+}
+
+validate_service_name() {
+    if [ -z "$1" ]; then
+        print_error "service name cannot be empty"
+        exit $EXIT_USAGE
+    fi
+    case "$1" in
+        */*|*..*)
+            print_error "invalid service name: $1"
+            exit $EXIT_USAGE
+            ;;
+    esac
+}
+
+is_available() {
+    [ -d "$SV_DIR/$1" ]
+}
+
+is_enabled() {
+    [ -L "$SERVICE_DIR/$1" ]
+}
+
+check_sv_available() {
+    if ! command -v sv >/dev/null 2>&1; then
+        print_error "sv command not found. Please install runit."
+        exit $EXIT_FAILURE
+    fi
+}
+
+check_permissions() {
+    if [ $? -ne 0 ]; then
+        if [ ! -w "$(dirname "$1")" ] 2>/dev/null; then
+            print_error "permission denied: $1"
+            exit $EXIT_PERMISSION
+        fi
+    fi
+}
+
+require_available() {
+    if ! is_available "$1"; then
+        print_error "service not found: $1"
+        exit $EXIT_NOT_FOUND
+    fi
+}
+
+require_enabled() {
+    if ! is_enabled "$1"; then
+        print_error "service not enabled: $1"
+        exit $EXIT_NOT_ENABLED
+    fi
+}
+
+check_symlink_target() {
+    service="$1"
+    link_path="$SERVICE_DIR/$service"
+    
+    if [ -L "$link_path" ]; then
+        if [ ! -e "$link_path" ]; then
+            print_error "broken symlink: $link_path"
+            exit $EXIT_FAILURE
+        fi
+        target=$(readlink "$link_path")
+        expected="$SV_DIR/$service"
+        if [ "$target" != "$expected" ]; then
+            print_error "symlink target mismatch: $link_path -> $target (expected $expected)"
+            exit $EXIT_FAILURE
+        fi
+    fi
+}
+
+wait_for_state() {
+    service="$1"
+    desired_state="$2"
+    timeout_sec="${3:-$TIMEOUT}"
+    
+    max_attempts=$((timeout_sec * 2))
+    attempt=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        status_output=$(sv status "$SERVICE_DIR/$service" 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            case "$status_output" in
+                *"$desired_state"*)
+                    return 0
+                    ;;
+            esac
+        fi
+        sleep 0.5
+        attempt=$((attempt + 1))
+    done
+    
+    return 1
+}
+
+parse_sv_status() {
+    status_output="$1"
+    service="$2"
+    
+    case "$status_output" in
+        run:*)
+            pid=$(echo "$status_output" | sed -n 's/.*(pid \([0-9]*\)).*/\1/p')
+            if [ -n "$pid" ]; then
+                uptime=$(echo "$status_output" | sed -n "s/.*(pid $pid) \(.*\)/\1/p" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                printf '%s: up (pid %s)' "$service" "$pid"
+                [ -n "$uptime" ] && printf ' %s' "$uptime"
+                echo
+            else
+                uptime=$(echo "$status_output" | sed -n 's/run:[^:]*: \(.*\)/\1/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                printf '%s: up' "$service"
+                [ -n "$uptime" ] && printf ' %s' "$uptime"
+                echo
+            fi
+            ;;
+        down:*)
+            if echo "$status_output" | grep -q "normally up"; then
+                printf '%s: down (normally up)\n' "$service"
+            elif is_enabled "$service"; then
+                printf '%s: down (normally up)\n' "$service"
+            else
+                printf '%s: down\n' "$service"
+            fi
+            ;;
+        *)
+            printf '%s: %s\n' "$service" "$status_output"
+            ;;
+    esac
+}
+
+usage() {
+    cat << EOF
+Usage: svcctl <command> [options] [service]
+
+Commands:
+  list                    List all available services
+  enabled                 List enabled services
+  disabled                List disabled services
+  enable <service>        Enable a service
+  disable <service>       Disable a service
+  start <service>         Start a service
+  stop <service>          Stop a service
+  restart <service>       Restart a service
+  status [service]        Show service status
+  reload <service>        Reload a service (send HUP)
+  check <service>         Check if service is up
+  once <service>          Run service once
+  zap <service>           Zap a service
+  log <service>           View service logs
+  profile <subcommand>    Profile management
+  audit                   System state audit
+
+Global options:
+  -h, --help              Show this help message
+  -V, --version           Show version
+  -q, --quiet             Suppress non-error output
+  -v, --verbose           Enable verbose output
+  --timeout SECONDS       Set timeout (default: 30)
+
+Exit codes:
+  0  Success
+  1  Operation failed / service down
+  2  Usage error
+  3  Service not found
+  4  Service not enabled
+  5  Permission denied
+  6  Timeout
+EOF
+}
+
+parse_options() {
+    remaining_args=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help|-V|--version)
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=1
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --timeout)
+                if [ -z "$2" ]; then
+                    print_error "--timeout requires a value"
+                    exit $EXIT_USAGE
+                fi
+                TIMEOUT="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                remaining_args="$remaining_args $*"
+                break
+                ;;
+            -*)
+                break
+                ;;
+            *)
+                remaining_args="$remaining_args $1"
+                shift
+                ;;
+        esac
+    done
+    while [ $# -gt 0 ]; do
+        remaining_args="$remaining_args $1"
+        shift
+    done
+    echo "$remaining_args"
+}
+
+cmd_list() {
+    filter_enabled=0
+    filter_disabled=0
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --enabled)
+                filter_enabled=1
+                shift
+                ;;
+            --disabled)
+                filter_disabled=1
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    if [ ! -d "$SV_DIR" ]; then
+        print_error "$SV_DIR does not exist"
+        exit $EXIT_FAILURE
+    fi
+    
+    for service_dir in "$SV_DIR"/*; do
+        [ -d "$service_dir" ] || continue
+        service=$(basename "$service_dir")
+        
+        if [ "$filter_enabled" -eq 1 ] && ! is_enabled "$service"; then
+            continue
+        fi
+        if [ "$filter_disabled" -eq 1 ] && is_enabled "$service"; then
+            continue
+        fi
+        
+        if [ "$QUIET" -eq 0 ]; then
+            if is_enabled "$service"; then
+                printf '%s: enabled\n' "$service"
+            else
+                printf '%s: disabled\n' "$service"
+            fi
+        fi
+    done
+}
+
+cmd_enabled() {
+    cmd_list --enabled "$@"
+}
+
+cmd_disabled() {
+    cmd_list --disabled "$@"
+}
+
+cmd_enable() {
+    if [ $# -eq 0 ]; then
+        print_error "enable requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_available "$service"
+    
+    if is_enabled "$service"; then
+        exit $EXIT_SUCCESS
+    fi
+    
+    if ! ln -s "$SV_DIR/$service" "$SERVICE_DIR/$service" 2>/dev/null; then
+        if [ ! -w "$SERVICE_DIR" ]; then
+            print_error "permission denied"
+            exit $EXIT_PERMISSION
+        fi
+        print_error "failed to enable service: $service"
+        exit $EXIT_FAILURE
+    fi
+}
+
+cmd_disable() {
+    no_stop=0
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-stop)
+                no_stop=1
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    if [ $# -eq 0 ]; then
+        print_error "disable requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    
+    if ! is_enabled "$service"; then
+        exit $EXIT_SUCCESS
+    fi
+    
+    check_symlink_target "$service"
+    
+    if [ "$no_stop" -eq 0 ]; then
+        sv down "$SERVICE_DIR/$service" >/dev/null 2>&1
+    fi
+    
+    if ! rm "$SERVICE_DIR/$service" 2>/dev/null; then
+        if [ ! -w "$SERVICE_DIR" ]; then
+            print_error "permission denied"
+            exit $EXIT_PERMISSION
+        fi
+        print_error "failed to disable service: $service"
+        exit $EXIT_FAILURE
+    fi
+}
+
+cmd_start() {
+    force=0
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force)
+                force=1
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    if [ $# -eq 0 ]; then
+        print_error "start requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_enabled "$service"
+    
+    if [ "$force" -eq 0 ] && [ -f "$SERVICE_DIR/$service/down" ]; then
+        print_error "service is marked down (use --force to override)"
+        exit $EXIT_FAILURE
+    fi
+    
+    if ! sv up "$SERVICE_DIR/$service" 2>/dev/null; then
+        print_error "failed to start service: $service"
+        exit $EXIT_FAILURE
+    fi
+    
+    if ! wait_for_state "$service" "run:" "$TIMEOUT"; then
+        print_error "service failed to start within timeout"
+        exit $EXIT_TIMEOUT
+    fi
+}
+
+cmd_stop() {
+    if [ $# -eq 0 ]; then
+        print_error "stop requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_enabled "$service"
+    
+    if ! sv down "$SERVICE_DIR/$service" 2>/dev/null; then
+        print_error "failed to stop service: $service"
+        exit $EXIT_FAILURE
+    fi
+    
+    if ! wait_for_state "$service" "down:" "$TIMEOUT"; then
+        print_error "service failed to stop within timeout"
+        exit $EXIT_TIMEOUT
+    fi
+}
+
+cmd_restart() {
+    if [ $# -eq 0 ]; then
+        print_error "restart requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_enabled "$service"
+    
+    if ! sv restart "$SERVICE_DIR/$service" 2>/dev/null; then
+        print_error "failed to restart service: $service"
+        exit $EXIT_FAILURE
+    fi
+    
+    if ! wait_for_state "$service" "run:" "$TIMEOUT"; then
+        print_error "service failed to restart (still down)"
+        exit $EXIT_FAILURE
+    fi
+}
+
+cmd_status() {
+    exit_code=$EXIT_SUCCESS
+    
+    if [ $# -eq 0 ]; then
+        if [ ! -d "$SERVICE_DIR" ]; then
+            exit $EXIT_SUCCESS
+        fi
+        
+        for service_link in "$SERVICE_DIR"/*; do
+            [ -L "$service_link" ] || continue
+            service=$(basename "$service_link")
+            
+            status_output=$(sv status "$service_link" 2>/dev/null)
+            if [ $? -ne 0 ]; then
+                exit_code=$EXIT_FAILURE
+                continue
+            fi
+            
+            if [ "$QUIET" -eq 0 ]; then
+                parse_sv_status "$status_output" "$service"
+            fi
+            
+            case "$status_output" in
+                down:*)
+                    exit_code=$EXIT_FAILURE
+                    ;;
+            esac
+        done
+    else
+        service="$1"
+        validate_service_name "$service"
+        
+        if ! is_enabled "$service"; then
+            print_error "service not enabled: $service"
+            exit $EXIT_NOT_ENABLED
+        fi
+        
+        status_output=$(sv status "$SERVICE_DIR/$service" 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            exit_code=$EXIT_FAILURE
+        else
+            if [ "$QUIET" -eq 0 ]; then
+                parse_sv_status "$status_output" "$service"
+            fi
+            
+            case "$status_output" in
+                down:*)
+                    exit_code=$EXIT_FAILURE
+                    ;;
+            esac
+        fi
+    fi
+    
+    exit $exit_code
+}
+
+cmd_reload() {
+    if [ $# -eq 0 ]; then
+        print_error "reload requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_enabled "$service"
+    
+    if ! sv hup "$SERVICE_DIR/$service" 2>/dev/null; then
+        print_error "failed to reload service: $service"
+        exit $EXIT_FAILURE
+    fi
+}
+
+cmd_check() {
+    if [ $# -eq 0 ]; then
+        print_error "check requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    
+    if ! is_enabled "$service"; then
+        exit $EXIT_NOT_ENABLED
+    fi
+    
+    status_output=$(sv status "$SERVICE_DIR/$service" 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        exit $EXIT_FAILURE
+    fi
+    
+    case "$status_output" in
+        run:*)
+            exit $EXIT_SUCCESS
+            ;;
+        *)
+            exit $EXIT_FAILURE
+            ;;
+    esac
+}
+
+cmd_once() {
+    if [ $# -eq 0 ]; then
+        print_error "once requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_enabled "$service"
+    
+    if ! sv once "$SERVICE_DIR/$service" 2>/dev/null; then
+        print_error "failed to run service once: $service"
+        exit $EXIT_FAILURE
+    fi
+    
+    if ! wait_for_state "$service" "run:" "$TIMEOUT"; then
+        print_error "service failed to start within timeout"
+        exit $EXIT_TIMEOUT
+    fi
+}
+
+cmd_zap() {
+    if [ $# -eq 0 ]; then
+        print_error "zap requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_enabled "$service"
+    
+    if ! sv zap "$SERVICE_DIR/$service" 2>/dev/null; then
+        print_error "failed to zap service: $service"
+        exit $EXIT_FAILURE
+    fi
+}
+
+cmd_log() {
+    follow=1
+    no_follow=0
+    lines=""
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f)
+                follow=1
+                no_follow=0
+                shift
+                ;;
+            -n)
+                if [ -z "$2" ]; then
+                    print_error "-n requires a number"
+                    exit $EXIT_USAGE
+                fi
+                lines="$2"
+                no_follow=1
+                follow=0
+                shift 2
+                ;;
+            --no-follow)
+                no_follow=1
+                follow=0
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    if [ $# -eq 0 ]; then
+        print_error "log requires a service name"
+        exit $EXIT_USAGE
+    fi
+    
+    service="$1"
+    validate_service_name "$service"
+    require_enabled "$service"
+    
+    log_file=""
+    
+    if [ -r "/var/log/sv/$service/current" ]; then
+        log_file="/var/log/sv/$service/current"
+    elif [ -r "$SERVICE_DIR/$service/log/main/current" ]; then
+        log_file="$SERVICE_DIR/$service/log/main/current"
+    elif [ -L "$SERVICE_DIR/$service/log" ]; then
+        log_target=$(readlink "$SERVICE_DIR/$service/log")
+        if [ -r "$log_target/main/current" ]; then
+            log_file="$log_target/main/current"
+        elif [ -r "/var/log/sv/$service/current" ]; then
+            log_file="/var/log/sv/$service/current"
+        fi
+    elif [ -f "$SV_DIR/$service/log/run" ]; then
+        if [ -r "/var/log/sv/$service/current" ]; then
+            log_file="/var/log/sv/$service/current"
+        elif [ -r "$SERVICE_DIR/$service/log/main/current" ]; then
+            log_file="$SERVICE_DIR/$service/log/main/current"
+        fi
+    fi
+    
+    if [ -z "$log_file" ]; then
+        print_error "no log file found for service: $service"
+        exit $EXIT_FAILURE
+    fi
+    
+    if [ ! -r "$log_file" ]; then
+        print_error "cannot read log file: $log_file"
+        exit $EXIT_PERMISSION
+    fi
+    
+    if [ "$no_follow" -eq 1 ] || [ "$follow" -eq 0 ]; then
+        if [ -n "$lines" ]; then
+            tail -n "$lines" "$log_file"
+        else
+            cat "$log_file"
+        fi
+    else
+        if [ -n "$lines" ]; then
+            tail -n "$lines" -f "$log_file"
+        else
+            tail -f "$log_file"
+        fi
+    fi
+}
+
+parse_profile_file() {
+    file="$1"
+    if [ ! -r "$file" ]; then
+        return 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            \#*|"")
+                continue
+                ;;
+            *)
+                printf '%s\n' "$line"
+                ;;
+        esac
+    done < "$file"
+}
+
+get_enabled_services() {
+    if [ ! -d "$SERVICE_DIR" ]; then
+        return 0
+    fi
+    for service_link in "$SERVICE_DIR"/*; do
+        [ -L "$service_link" ] || continue
+        basename "$service_link"
+    done
+}
+
+create_snapshot() {
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    snapshot_path="$SNAPSHOT_DIR/$timestamp"
+    
+    if ! mkdir -p "$snapshot_path" 2>/dev/null; then
+        print_error "failed to create snapshot directory"
+        return 1
+    fi
+    
+    get_enabled_services > "$snapshot_path/enabled-services" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        print_error "failed to write snapshot"
+        return 1
+    fi
+    
+    echo "$timestamp"
+    return 0
+}
+
+get_latest_snapshot() {
+    if [ ! -d "$SNAPSHOT_DIR" ]; then
+        return 1
+    fi
+    
+    latest=""
+    for snapshot in "$SNAPSHOT_DIR"/*; do
+        [ -d "$snapshot" ] || continue
+        snapshot_name=$(basename "$snapshot")
+        if [ -z "$latest" ] || [ "$snapshot_name" \> "$latest" ]; then
+            latest="$snapshot_name"
+        fi
+    done
+    
+    if [ -n "$latest" ]; then
+        echo "$latest"
+        return 0
+    fi
+    return 1
+}
+
+compose_profiles() {
+    profile_name="$1"
+    enable_list=""
+    disable_list=""
+    
+    if [ -r "$PROFILE_DIR/base/enable" ]; then
+        enable_list="$enable_list
+$(parse_profile_file "$PROFILE_DIR/base/enable")"
+    fi
+    
+    if [ -r "$PROFILE_DIR/base/disable" ]; then
+        disable_list="$disable_list
+$(parse_profile_file "$PROFILE_DIR/base/disable")"
+    fi
+    
+    if [ "$profile_name" != "base" ] && [ -n "$profile_name" ]; then
+        if [ -r "$PROFILE_DIR/$profile_name/enable" ]; then
+            enable_list="$enable_list
+$(parse_profile_file "$PROFILE_DIR/$profile_name/enable")"
+        fi
+        
+        if [ -r "$PROFILE_DIR/$profile_name/disable" ]; then
+            disable_list="$disable_list
+$(parse_profile_file "$PROFILE_DIR/$profile_name/disable")"
+        fi
+    fi
+    
+    if [ -r "$LOCAL_DIR/enable" ]; then
+        enable_list="$enable_list
+$(parse_profile_file "$LOCAL_DIR/enable")"
+    fi
+    
+    if [ -r "$LOCAL_DIR/disable" ]; then
+        disable_list="$disable_list
+$(parse_profile_file "$LOCAL_DIR/disable")"
+    fi
+    
+    enable_services=""
+    for service in $(echo "$enable_list" | grep -v '^$' | sort -u); do
+        enable_services="$enable_services $service"
+    done
+    
+    disable_services=""
+    for service in $(echo "$disable_list" | grep -v '^$' | sort -u); do
+        case " $enable_services " in
+            *" $service "*)
+                continue
+                ;;
+        esac
+        disable_services="$disable_services $service"
+    done
+    
+    printf 'ENABLE:%s\n' "$enable_services"
+    printf 'DISABLE:%s\n' "$disable_services"
+}
+
+cmd_profile_list() {
+    if [ ! -d "$PROFILE_DIR" ]; then
+        if [ "$QUIET" -eq 0 ]; then
+            printf 'No profiles directory found at %s\n' "$PROFILE_DIR"
+        fi
+        return 0
+    fi
+    
+    for profile_dir in "$PROFILE_DIR"/*; do
+        [ -d "$profile_dir" ] || continue
+        profile=$(basename "$profile_dir")
+        if [ "$QUIET" -eq 0 ]; then
+            printf '%s\n' "$profile"
+        fi
+    done
+}
+
+cmd_profile_show() {
+    if [ $# -eq 0 ]; then
+        print_error "profile show requires a profile name"
+        exit $EXIT_USAGE
+    fi
+    
+    profile="$1"
+    profile_path="$PROFILE_DIR/$profile"
+    
+    if [ ! -d "$profile_path" ]; then
+        print_error "profile not found: $profile"
+        exit $EXIT_NOT_FOUND
+    fi
+    
+    if [ "$QUIET" -eq 0 ]; then
+        printf 'Profile: %s\n' "$profile"
+        printf '\n'
+        
+        if [ -r "$profile_path/enable" ]; then
+            printf 'Services to enable:\n'
+            parse_profile_file "$profile_path/enable" | while read -r service; do
+                [ -z "$service" ] && continue
+                printf '  %s\n' "$service"
+            done
+            printf '\n'
+        fi
+        
+        if [ -r "$profile_path/disable" ]; then
+            printf 'Services to disable:\n'
+            parse_profile_file "$profile_path/disable" | while read -r service; do
+                [ -z "$service" ] && continue
+                printf '  %s\n' "$service"
+            done
+            printf '\n'
+        fi
+        
+        if [ -f "$profile_path/sysctl.conf" ]; then
+            printf 'Configuration: sysctl.conf\n'
+        fi
+        
+        if [ -d "$profile_path/sshd_config.d" ]; then
+            printf 'Configuration: sshd_config.d/\n'
+        fi
+        
+        if [ -f "$profile_path/nftables.conf" ]; then
+            printf 'Configuration: nftables.conf\n'
+        fi
+    fi
+}
+
+cmd_profile_apply() {
+    now=0
+    no_snapshot=0
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --now)
+                now=1
+                shift
+                ;;
+            --no-snapshot)
+                no_snapshot=1
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    if [ $# -eq 0 ]; then
+        print_error "profile apply requires a profile name"
+        exit $EXIT_USAGE
+    fi
+    
+    profile="$1"
+    profile_path="$PROFILE_DIR/$profile"
+    
+    if [ ! -d "$profile_path" ]; then
+        print_error "profile not found: $profile"
+        exit $EXIT_NOT_FOUND
+    fi
+    
+    if [ "$no_snapshot" -eq 0 ]; then
+        snapshot=$(create_snapshot)
+        if [ $? -ne 0 ]; then
+            print_error "failed to create snapshot"
+            exit $EXIT_FAILURE
+        fi
+        print_verbose "Created snapshot: $snapshot"
+    fi
+    
+    composition=$(compose_profiles "$profile")
+    enable_list=$(echo "$composition" | grep '^ENABLE:' | sed 's/^ENABLE://' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    disable_list=$(echo "$composition" | grep '^DISABLE:' | sed 's/^DISABLE://' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    current_enabled=$(get_enabled_services)
+    
+    for service in $disable_list; do
+        [ -z "$service" ] && continue
+        if is_enabled "$service"; then
+            if [ "$QUIET" -eq 0 ]; then
+                printf 'Disabling: %s\n' "$service"
+            fi
+            if ! rm "$SERVICE_DIR/$service" 2>/dev/null; then
+                if [ -w "$SERVICE_DIR" ]; then
+                    cmd_disable "$service" >/dev/null 2>&1
+                fi
+            fi
+            if [ "$now" -eq 1 ]; then
+                sv down "$SERVICE_DIR/$service" >/dev/null 2>&1
+            fi
+        fi
+    done
+    
+    for service in $enable_list; do
+        [ -z "$service" ] && continue
+        if ! is_available "$service"; then
+            print_error "service not found: $service"
+            continue
+        fi
+        if ! is_enabled "$service"; then
+            if [ "$QUIET" -eq 0 ]; then
+                printf 'Enabling: %s\n' "$service"
+            fi
+            if ! ln -sf "$SV_DIR/$service" "$SERVICE_DIR/$service" 2>/dev/null; then
+                if [ -w "$SERVICE_DIR" ]; then
+                    cmd_enable "$service" >/dev/null 2>&1
+                fi
+            fi
+            if [ "$now" -eq 1 ]; then
+                sv up "$SERVICE_DIR/$service" >/dev/null 2>&1
+            fi
+        fi
+    done
+    
+    for service in $current_enabled; do
+        case " $enable_list " in
+            *" $service "*)
+                continue
+                ;;
+        esac
+        case " $disable_list " in
+            *" $service "*)
+                continue
+                ;;
+        esac
+        if [ "$QUIET" -eq 0 ]; then
+            printf 'Disabling: %s\n' "$service"
+        fi
+        if ! rm "$SERVICE_DIR/$service" 2>/dev/null; then
+            if [ -w "$SERVICE_DIR" ]; then
+                cmd_disable "$service" >/dev/null 2>&1
+            fi
+        fi
+        if [ "$now" -eq 1 ]; then
+            sv down "$SERVICE_DIR/$service" >/dev/null 2>&1
+        fi
+    done
+    
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        print_error "failed to create state directory"
+        exit $EXIT_FAILURE
+    fi
+    
+    printf '%s\n' "$profile" > "$STATE_DIR/current-profile" 2>/dev/null
+    
+    apply_config_fragments "$profile"
+}
+
+apply_config_fragments() {
+    profile="$1"
+    profile_path="$PROFILE_DIR/$profile"
+    
+    if [ -f "$profile_path/sysctl.conf" ]; then
+        if [ -d "/etc/sysctl.d" ]; then
+            if ! cp "$profile_path/sysctl.conf" "/etc/sysctl.d/svcctl-$profile.conf" 2>/dev/null; then
+                print_verbose "failed to apply sysctl.conf (requires root)"
+            else
+                print_verbose "applied sysctl.conf"
+            fi
+        fi
+    fi
+    
+    if [ -d "$profile_path/sshd_config.d" ]; then
+        if [ -d "/etc/ssh/sshd_config.d" ]; then
+            for config_file in "$profile_path/sshd_config.d"/*.conf; do
+                [ -f "$config_file" ] || continue
+                config_name=$(basename "$config_file")
+                if ! cp "$config_file" "/etc/ssh/sshd_config.d/svcctl-$profile-$config_name" 2>/dev/null; then
+                    print_verbose "failed to apply sshd config $config_name (requires root)"
+                else
+                    print_verbose "applied sshd config $config_name"
+                fi
+            done
+        fi
+    fi
+    
+    if [ -f "$profile_path/nftables.conf" ]; then
+        if [ -d "/etc/nftables.d" ]; then
+            if ! cp "$profile_path/nftables.conf" "/etc/nftables.d/svcctl-$profile.conf" 2>/dev/null; then
+                print_verbose "failed to apply nftables.conf (requires root)"
+            else
+                print_verbose "applied nftables.conf"
+                if command -v nft >/dev/null 2>&1; then
+                    if nft -f "/etc/nftables.d/svcctl-$profile.conf" 2>/dev/null; then
+                        print_verbose "loaded nftables rules"
+                    else
+                        print_verbose "failed to load nftables rules (check syntax)"
+                    fi
+                fi
+            fi
+        elif [ -f "/etc/nftables.conf" ]; then
+            print_verbose "nftables.conf detected (manual integration with /etc/nftables.conf required)"
+        else
+            print_verbose "nftables.conf detected (nftables not configured on system)"
+        fi
+    fi
+}
+
+cmd_profile_revert() {
+    latest=$(get_latest_snapshot)
+    if [ $? -ne 0 ]; then
+        print_error "no snapshot found"
+        exit $EXIT_FAILURE
+    fi
+    
+    snapshot_path="$SNAPSHOT_DIR/$latest"
+    if [ ! -r "$snapshot_path/enabled-services" ]; then
+        print_error "snapshot file not found"
+        exit $EXIT_FAILURE
+    fi
+    
+    current_enabled=$(get_enabled_services)
+    snapshot_enabled=$(cat "$snapshot_path/enabled-services")
+    
+    for service in $current_enabled; do
+        case " $snapshot_enabled " in
+            *" $service "*)
+                continue
+                ;;
+        esac
+        if [ "$QUIET" -eq 0 ]; then
+            printf 'Disabling: %s\n' "$service"
+        fi
+        cmd_disable "$service" >/dev/null 2>&1
+    done
+    
+    for service in $snapshot_enabled; do
+        [ -z "$service" ] && continue
+        if ! is_available "$service"; then
+            continue
+        fi
+        if ! is_enabled "$service"; then
+            if [ "$QUIET" -eq 0 ]; then
+                printf 'Enabling: %s\n' "$service"
+            fi
+            cmd_enable "$service" >/dev/null 2>&1
+        fi
+    done
+}
+
+cmd_profile_current() {
+    if [ -r "$STATE_DIR/current-profile" ]; then
+        profile=$(cat "$STATE_DIR/current-profile")
+        if [ "$QUIET" -eq 0 ]; then
+            printf '%s\n' "$profile"
+        fi
+    else
+        if [ "$QUIET" -eq 0 ]; then
+            printf 'No profile applied\n'
+        fi
+        exit $EXIT_FAILURE
+    fi
+}
+
+cmd_profile_diff() {
+    if [ $# -eq 0 ]; then
+        print_error "profile diff requires a profile name"
+        exit $EXIT_USAGE
+    fi
+    
+    profile="$1"
+    profile_path="$PROFILE_DIR/$profile"
+    
+    if [ ! -d "$profile_path" ]; then
+        print_error "profile not found: $profile"
+        exit $EXIT_NOT_FOUND
+    fi
+    
+    composition=$(compose_profiles "$profile")
+    target_enable=$(echo "$composition" | grep '^ENABLE:' | sed 's/^ENABLE://' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    target_disable=$(echo "$composition" | grep '^DISABLE:' | sed 's/^DISABLE://' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    current_enabled=$(get_enabled_services)
+    
+    if [ "$QUIET" -eq 0 ]; then
+        printf 'Services to enable:\n'
+        for service in $target_enable; do
+            [ -z "$service" ] && continue
+            case " $current_enabled " in
+                *" $service "*)
+                    continue
+                    ;;
+            esac
+            printf '  + %s\n' "$service"
+        done
+        
+        printf '\nServices to disable:\n'
+        for service in $target_disable; do
+            [ -z "$service" ] && continue
+            if is_enabled "$service"; then
+                printf '  - %s\n' "$service"
+            fi
+        done
+        for service in $current_enabled; do
+            case " $target_enable " in
+                *" $service "*)
+                    continue
+                    ;;
+            esac
+            case " $target_disable " in
+                *" $service "*)
+                    continue
+                    ;;
+            esac
+            printf '  - %s\n' "$service"
+        done
+    fi
+}
+
+cmd_profile() {
+    if [ $# -eq 0 ]; then
+        print_error "profile requires a subcommand"
+        exit $EXIT_USAGE
+    fi
+    
+    subcmd="$1"
+    shift
+    
+    case "$subcmd" in
+        list)
+            cmd_profile_list "$@"
+            ;;
+        show)
+            cmd_profile_show "$@"
+            ;;
+        apply)
+            cmd_profile_apply "$@"
+            ;;
+        revert)
+            cmd_profile_revert "$@"
+            ;;
+        current)
+            cmd_profile_current "$@"
+            ;;
+        diff)
+            cmd_profile_diff "$@"
+            ;;
+        *)
+            print_error "unknown profile subcommand: $subcmd"
+            exit $EXIT_USAGE
+            ;;
+    esac
+}
+
+cmd_audit() {
+    if [ "$QUIET" -eq 0 ]; then
+        printf 'System Audit\n'
+        printf '============\n\n'
+        
+        printf 'Enabled services:\n'
+        for service in $(get_enabled_services); do
+            status_output=$(sv status "$SERVICE_DIR/$service" 2>/dev/null)
+            sv_exit=$?
+            if [ $sv_exit -eq 0 ] && [ -n "$status_output" ]; then
+                case "$status_output" in
+                    run:*)
+                        printf '  %s: up\n' "$service"
+                        ;;
+                    down:*)
+                        printf '  %s: down (enabled)\n' "$service"
+                        ;;
+                    *)
+                        printf '  %s: %s\n' "$service" "$status_output"
+                        ;;
+                esac
+            else
+                printf '  %s: enabled\n' "$service"
+            fi
+        done
+        
+        printf '\nDisabled services:\n'
+        for service_dir in "$SV_DIR"/*; do
+            [ -d "$service_dir" ] || continue
+            service=$(basename "$service_dir")
+            if ! is_enabled "$service"; then
+                printf '  %s\n' "$service"
+            fi
+        done
+        
+        printf '\nActive profile: '
+        if [ -r "$STATE_DIR/current-profile" ]; then
+            cat "$STATE_DIR/current-profile"
+        else
+            printf 'none\n'
+        fi
+        
+        printf '\nLocal overrides: '
+        if [ -r "$LOCAL_DIR/enable" ] || [ -r "$LOCAL_DIR/disable" ]; then
+            printf 'present\n'
+        else
+            printf 'none\n'
+        fi
+    fi
+}
+
+main() {
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                usage
+                exit $EXIT_SUCCESS
+                ;;
+            -V|--version)
+                echo "svcctl version $VERSION"
+                exit $EXIT_SUCCESS
+                ;;
+        esac
+    done
+    
+    remaining=$(parse_options "$@")
+    set -- $remaining
+    
+    if [ $# -eq 0 ]; then
+        print_error "no command specified"
+        usage >&2
+        exit $EXIT_USAGE
+    fi
+    
+    cmd="$1"
+    shift
+    
+    case "$cmd" in
+        list)
+            cmd_list "$@"
+            ;;
+        enabled)
+            cmd_enabled "$@"
+            ;;
+        disabled)
+            cmd_disabled "$@"
+            ;;
+        enable)
+            cmd_enable "$@"
+            ;;
+        disable)
+            cmd_disable "$@"
+            ;;
+        start)
+            cmd_start "$@"
+            ;;
+        stop)
+            cmd_stop "$@"
+            ;;
+        restart)
+            cmd_restart "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        reload)
+            cmd_reload "$@"
+            ;;
+        check)
+            cmd_check "$@"
+            ;;
+        once)
+            cmd_once "$@"
+            ;;
+        zap)
+            cmd_zap "$@"
+            ;;
+        log)
+            cmd_log "$@"
+            ;;
+        profile)
+            cmd_profile "$@"
+            ;;
+        audit)
+            cmd_audit "$@"
+            ;;
+        *)
+            print_error "unknown command: $cmd"
+            usage >&2
+            exit $EXIT_USAGE
+            ;;
+    esac
+}
+
+check_sv_available
+
+main "$@"

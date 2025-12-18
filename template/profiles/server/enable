@@ -1,0 +1,7 @@
+# Server profile - services for secure, robust servers
+# Remote access
+sshd
+
+# Additional logging (if available)
+# socklog-tcp (if needed for remote log collection)
+

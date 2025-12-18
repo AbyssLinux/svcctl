@@ -1,0 +1,7 @@
+# Workstation profile - disable server-specific services
+# SSH disabled by default on workstations (enable manually if needed)
+sshd
+
+# Server-specific services
+socklog-tcp
+

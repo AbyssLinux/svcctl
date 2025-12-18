@@ -1,0 +1,13 @@
+# Workstation profile - services for secure workstations
+# Network management
+NetworkManager
+
+# Audio
+alsa
+
+# Console access (for local use)
+agetty-tty1
+agetty-tty2
+agetty-tty3
+agetty-tty4
+

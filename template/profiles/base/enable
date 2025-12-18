@@ -1,0 +1,13 @@
+# Base profile - minimal services for all systems
+# Logging
+socklog-unix
+nanoklogd
+
+# Time synchronization
+chronyd
+
+# System services
+udevd
+dbus
+polkitd
+

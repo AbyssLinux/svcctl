@@ -1,0 +1,4 @@
+# Base profile - services disabled by default
+# Network services disabled in base (enable in role profiles)
+# Desktop services disabled in base (enable in workstation profile)
+

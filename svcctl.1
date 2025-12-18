@@ -1,0 +1,282 @@
+.TH SVCCTL 1 "2025" "svcctl" "Void Linux Service Control"
+.SH NAME
+svcctl \- minimal wrapper around runit for Void Linux
+.SH SYNOPSIS
+.B svcctl
+[\fIglobal-options\fR] \fIcommand\fR [\fIoptions\fR] [\fIservice\fR]
+.SH DESCRIPTION
+.B svcctl
+is a minimal wrapper around runit for Void Linux.
+.PP
+.B svcctl
+operates on services defined in
+.B /etc/sv
+and enabled via symlinks in
+.BR /var/service .
+All lifecycle commands operate only on enabled services.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-h ", " --help
+Show help message and exit.
+.TP
+.BR \-V ", " --version
+Show version and exit.
+.TP
+.BR \-q ", " --quiet
+Suppress non-error output.
+.TP
+.BR \-v ", " --verbose
+Enable verbose output.
+.TP
+.BI --timeout " SECONDS"
+Set timeout for state changes in seconds (default: 30).
+.SH COMMANDS
+.SS list
+List all available services in
+.BR /etc/sv .
+.TP
+.B --enabled
+List only enabled services.
+.TP
+.B --disabled
+List only disabled services.
+.SS enabled
+Alias for
+.BR "list --enabled" .
+.SS disabled
+Alias for
+.BR "list --disabled" .
+.SS enable \fISERVICE\fR
+Create a symlink in
+.B /var/service
+to enable the service. Does not start the service.
+.SS disable \fISERVICE\fR
+Stop the service (unless
+.B --no-stop
+is used) and remove the symlink from
+.BR /var/service .
+Refuses non-symlink targets.
+.TP
+.B --no-stop
+Do not stop the service before disabling.
+.SS start \fISERVICE\fR
+Start an enabled service using
+.BR "sv up" .
+Requires the service to be enabled. Refuses if a
+.B down
+file exists unless
+.B --force
+is used. Waits up to the timeout for the service to start.
+.TP
+.B --force
+Start the service even if a
+.B down
+file exists.
+.SS stop \fISERVICE\fR
+Stop an enabled service using
+.BR "sv down" .
+Waits up to the timeout for the service to stop.
+.SS restart \fISERVICE\fR
+Restart an enabled service using
+.BR "sv restart" .
+Waits up to the timeout and fails if the service remains down.
+.SS status [\fISERVICE\fR]
+Show service status via
+.BR "sv status" .
+If no service is specified, shows status for all enabled services.
+Exits nonzero if the service (or any service) is down.
+.SS reload \fISERVICE\fR
+Send HUP signal to the service using
+.BR "sv hup" .
+Does not wait for completion.
+.SS check \fISERVICE\fR
+Silent health check. Exits 0 if the service is up, 1 if down.
+.SS once \fISERVICE\fR
+Run the service once using
+.BR "sv once" .
+Waits up to the timeout for the service to start.
+.SS zap \fISERVICE\fR
+Zap the service using
+.BR "sv zap" .
+Does not wait for completion.
+.SS log \fISERVICE\fR
+View service logs. Best-effort log discovery:
+.IP \(bu 2
+Primary target:
+.B /var/log/sv/\fISERVICE\fR/current
+.IP \(bu 2
+Fallback:
+.B /var/service/\fISERVICE\fR/log/main/current
+.PP
+Discovery checks:
+.B /var/service/\fISERVICE\fR/log
+(symlink) and
+.B /etc/sv/\fISERVICE\fR/log/run
+(log service exists).
+.TP
+.B -f
+Follow logs (default).
+.TP
+.BI -n " N"
+Show last N lines.
+.TP
+.B --no-follow
+Do not follow logs, just show current content.
+.SS profile \fISUBCOMMAND\fR
+Profile management for declarative service configuration.
+.TP
+.B list
+List available profiles.
+.TP
+.B show \fIPROFILE\fR
+Display profile contents (services and configuration files).
+.TP
+.B diff \fIPROFILE\fR
+Show what changes would be made compared to current system state.
+.TP
+.B apply \fIPROFILE\fR [\fB--now\fR] [\fB--no-snapshot\fR]
+Apply profile to system. Creates snapshot by default.
+.TP
+.B revert
+Restore previous snapshot.
+.TP
+.B current
+Show last applied profile.
+.SS audit
+System state audit. Shows enabled/disabled services, active profile, and local overrides.
+.SH EXIT CODES
+.TP
+.B 0
+Success
+.TP
+.B 1
+Operation failed / service down
+.TP
+.B 2
+Usage error
+.TP
+.B 3
+Service not found
+.TP
+.B 4
+Service not enabled
+.TP
+.B 5
+Permission denied
+.TP
+.B 6
+Timeout
+.SH ENVIRONMENT
+.B svcctl
+uses fixed paths following Void Linux conventions:
+.TP
+.B /etc/sv/\fISERVICE\fR/
+Service definitions
+.TP
+.B /var/service/\fISERVICE\fR
+Symlink to enabled service (points to /etc/sv/\fISERVICE\fR/)
+.SH EXAMPLES
+List all services:
+.RS
+.PP
+$ svcctl list
+.RE
+.PP
+Enable and start a service:
+.RS
+.PP
+$ svcctl enable nginx
+.br
+$ svcctl start nginx
+.RE
+.PP
+Check service status:
+.RS
+.PP
+$ svcctl status nginx
+.RE
+.PP
+View service logs:
+.RS
+.PP
+$ svcctl log nginx -n 50
+.RE
+.PP
+Restart a service:
+.RS
+.PP
+$ svcctl restart nginx
+.RE
+.PP
+Apply a profile:
+.RS
+.PP
+$ svcctl profile show server
+.br
+$ svcctl profile diff server
+.br
+$ sudo svcctl profile apply server
+.RE
+.PP
+Revert to previous state:
+.RS
+.PP
+$ sudo svcctl profile revert
+.RE
+.PP
+Audit system state:
+.RS
+.PP
+$ svcctl audit
+.RE
+.SH PROFILES
+.B svcctl
+supports declarative service management through profiles. Profiles define which services should be enabled or disabled, and can include configuration fragments (sysctl, SSH, firewall).
+.PP
+Profiles are stored in
+.B /etc/svcctl/profiles/
+and are composed in layers:
+.IP \(bu 2
+Base profile: Common services for all systems (stored in
+.BR base/ )
+.IP \(bu 2
+Role profile: System-specific configuration (e.g., server, workstation)
+.IP \(bu 2
+Local overrides: User-defined customizations (stored in
+.BR /etc/svcctl/local/ )
+.PP
+Local overrides take precedence over profile settings. Services listed in both enable and disable lists will be enabled (enable wins).
+.PP
+Each profile directory can contain:
+.TP
+.B enable
+List of services to enable (one per line, # for comments)
+.TP
+.B disable
+List of services to disable (one per line, # for comments)
+.TP
+.B sysctl.conf
+Kernel parameters applied to
+.BR /etc/sysctl.d/svcctl-<profile>.conf
+.TP
+.B sshd_config.d/
+SSH configuration fragments copied to
+.BR /etc/ssh/sshd_config.d/svcctl-<profile>-<name>.conf
+.TP
+.B nftables.conf
+Firewall rules copied to
+.BR /etc/nftables.d/svcctl-<profile>.conf
+and loaded with
+.BR "nft -f"
+.PP
+When applying a profile, svcctl automatically creates a snapshot of the current service state in
+.BR /var/lib/svcctl/snapshots/ ,
+allowing you to revert changes with
+.BR "profile revert" .
+Snapshots are timestamped in UTC format (YYYY-MM-DDTHH:MM:SSZ).
+.PP
+Configuration fragments require root permissions to apply. Failed applications are logged in verbose mode but do not prevent profile application.
+.SH SEE ALSO
+.BR sv (8),
+.BR runit (8)
+
